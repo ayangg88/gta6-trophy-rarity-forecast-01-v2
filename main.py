@@ -1,71 +1,70 @@
-"""gta6-trophy-rarity-forecast-01: forecast GTA VI trophy earn rates on Exophase.
+"""Forecast GTA VI PlayStation 5 trophy earn rates on Exophase, one week out.
 
-For every trophy, forecast its earn rate at the case's target as five
-quantiles (5%, 25%, 50%, 75%, 95%), scored by pinball loss on the logit
-scale. Python 3.13, standard library only, deterministic, no network.
+Reads every <id>.in case in the input directory (MAKEFUN_INPUT_DIR, else
+/input) and writes one <id>.out forecast per case to the output directory
+(MAKEFUN_OUTPUT_DIR, else /output). Each output is exactly
+{"trophies": [{"id": n, "q": [q05, q25, q50, q75, q95]}, ...]}.
 
-Model
------
-A rate is a ratio of two growing quantities, so each trophy's rate is
-decomposed into earners over tracked players: E = rate / 100 * N with
-N = players_tracked. log(E) and log(N) are each fitted against
-x = ln(1 + hours since release, 2026-11-19T00:00:00Z) by recency-weighted
-least squares (24 h half-life), extrapolated to the target, and the median
-rate is 100 * E / N. Each trophy's earner slope is shrunk toward its
-tier's median slope, weight n / (n + 4) on its own slope, so noisy or
-rare trophies stay sane; the platinum trophy is shrunk heavily toward
-a slow-growth prior and its median is capped at single digits.
+Method
+------
+A trophy's earn rate is a ratio: earners over tracked players. Work with the
+two separately, because the tracked population grows much faster than any
+trophy's earners early on, which dilutes the rates. For each read, N is
+players_tracked and E_i = rate_i / 100 * N is trophy i's earners.
+
+Let x = ln(1 + hours since the game's release, 2026-11-19T00:00:00Z). Fit
+recency-weighted least squares of log(E_i) on x and of log(N) on x over the
+case's history (24-hour half-life, so recent reads count more), extrapolate
+both to the target's x, and take the median rate as 100 * E / N, clamped to
+0.01..99.99. Each trophy's earner slope is shrunk toward its tier's median
+slope, weight n / (n + 4) where n is its number of fitted reads; the
+platinum, which only grows as players finish everything, is shrunk heavily
+toward zero growth and its median is capped at single digits.
 
 Flat history (every read identical, as on launch night): no trend can be
-estimated. The median is the last rate shifted down for dilution by new
-players -- last * 0.3 while the tracked population is still small
-(under 10,000), else last / sqrt(1 + horizon_days) -- with a wide
-spread, because Exophase's first refresh (638 -> 3,868 tracked) cut
-every rate to roughly a fifth. A trophy at 100% in the last read stays
-at 100%.
+estimated, so the median is the last rate shifted down by dilution -- times
+0.3 while the tracked population is still small (under 10,000 players), else
+divided by sqrt(1 + horizon in days) -- with a wide spread, because the next
+Exophase refresh can move every rate at once.
 
-Spread (logit units): flat history, sigma = max(0.5, 1.2 * sqrt(days)),
-capped at 2.5; otherwise sigma combines the random-walk term
-(0.5 * sqrt(days)), the fit residual and the slope uncertainty times the
-distance to the target in x, floored at 0.35 and capped at 2.5.
-Quantiles: q = 100 / (1 + exp(-(logit(median) + z * sigma))), rounded
-to 4 decimals half-up, enforced non-decreasing.
+Spread: sigma in logit units combines a random-walk term, the fit residual
+and the slope uncertainty times the distance to the target in x, floored at
+0.35 and capped at 2.5. Quantiles are q_tau = inv_logit(logit(median) +
+z_tau * sigma), rounded to 4 decimals half-up.
 
-A case that fails anywhere still writes a valid output: the last read's
-rates with a wide spread, so no case is ever invalid.
+A trophy at 100% in the last read stays at ~100%. Any failure on a case
+still writes a valid output: the last read's rates with a wide spread.
+Deterministic, standard library only, no network.
 """
 
 import json
 import math
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
-
 RELEASE = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
 HALF_LIFE_HOURS = 24.0
 SHRINK_PRIOR = 4.0
-PLATINUM_CAP = 5.0
-SIGMA_FLOOR = 0.35
-SIGMA_CAP = 2.5
 
 
-def parse_time(text):
-    """Parse an ISO 8601 timestamp (trailing Z allowed) to an aware datetime."""
-    return datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+def parse_time(value):
+    """Parse an ISO 8601 timestamp (with a Z or an offset) to an aware datetime."""
+    if isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    raise ValueError("not a timestamp string")
 
 
-def hours_since_release(moment, release):
-    return max(0.0, (moment - release).total_seconds() / 3600.0)
-
-
-def clamp_rate(x):
-    return min(99.99, max(0.01, x))
+def clamp_rate(pct):
+    return min(99.99, max(0.01, pct))
 
 
 def logit(pct):
@@ -78,68 +77,68 @@ def inv_logit(lg):
 
 
 def round4(x):
-    """x rounded to 4 decimals, half up (as the starter rounds it).
-
-    A whole number comes back as an int, so json.dumps writes 100
-    where 100.0 would also be valid but longer.
-    """
+    """Round to 4 decimals, half up, as the starter does."""
     scaled = x * 10000
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
         whole += 1
     value = whole / 10000
-    return int(value) if value.is_integer() else value
+    return int(value) if value == int(value) else value
+
+
+def wls(points):
+    """Recency-weighted least squares of y on x.
+
+    points is a list of (x, y, weight). Returns (intercept, slope, resid_std,
+    slope_se, xbar) or None when the fit is degenerate. Needs at least 3
+    distinct x values for a slope; otherwise the slope is 0.
+    """
+    if not points:
+        return None
+    xs = [p[0] for p in points]
+    if len(set(xs)) < 3:
+        sw = sum(p[2] for p in points)
+        xbar = sum(p[2] * p[0] for p in points) / sw if sw else xs[0]
+        ybar = sum(p[2] * p[1] for p in points) / sw if sw else points[0][1]
+        resid = math.sqrt(
+            sum(p[2] * (p[1] - ybar) ** 2 for p in points) / sw
+        ) if sw else 0.0
+        return (ybar, 0.0, resid, 0.0, xbar)
+    sw = sum(p[2] for p in points)
+    xbar = sum(p[2] * p[0] for p in points) / sw
+    ybar = sum(p[2] * p[1] for p in points) / sw
+    sxx = sum(p[2] * (p[0] - xbar) ** 2 for p in points)
+    if sxx <= 0:
+        return (ybar, 0.0, 0.0, 0.0, xbar)
+    sxy = sum(p[2] * (p[0] - xbar) * (p[1] - ybar) for p in points)
+    slope = sxy / sxx
+    intercept = ybar - slope * xbar
+    n = len(points)
+    rss = sum(p[2] * (p[1] - (intercept + slope * p[0])) ** 2 for p in points)
+    dof = max(n - 2, 1)
+    resid = math.sqrt(rss / sw * n / dof) if sw else 0.0
+    slope_se = math.sqrt((rss / dof) / sxx) if sxx > 0 else 0.0
+    return (intercept, slope, resid, slope_se, xbar)
 
 
 def median_of(values):
     ordered = sorted(values)
-    n = len(ordered)
-    if n == 0:
+    m = len(ordered)
+    if m == 0:
         return 0.0
-    if n % 2:
-        return ordered[n // 2]
-    return 0.5 * (ordered[n // 2 - 1] + ordered[n // 2])
-
-
-def wls(xs, ys, ws):
-    """Recency-weighted least squares of y on x.
-
-    Returns (intercept, slope, residual_std, slope_se, n). With fewer
-    than 3 distinct x values the slope is 0 and the intercept is the
-    weighted mean, so the fit is flat by construction.
-    """
-    n = len(xs)
-    if n == 0:
-        return 0.0, 0.0, 0.0, 0.5, 0
-    sw = sum(ws)
-    xm = sum(w * x for w, x in zip(ws, xs)) / sw
-    ym = sum(w * y for w, y in zip(ws, ys)) / sw
-    distinct = len({round(x, 6) for x in xs})
-    sxx = sum(w * (x - xm) ** 2 for w, x in zip(ws, xs))
-    if distinct < 3 or sxx <= 1e-12:
-        resid = [y - ym for y in ys]
-        var = sum(w * r * r for w, r in zip(ws, resid)) / sw if n else 0.0
-        return ym, 0.0, math.sqrt(max(var, 0.0)), 0.5, n
-    sxy = sum(w * (x - xm) * (y - ym) for w, x, y in zip(ws, xs, ys))
-    slope = sxy / sxx
-    intercept = ym - slope * xm
-    resid = [y - (intercept + slope * x) for x, y in zip(xs, ys)]
-    var = sum(w * r * r for w, r in zip(ws, resid)) / sw
-    if n > 2:
-        var *= n / (n - 2)
-    se = math.sqrt(max(var, 0.0) / sxx) if sxx > 0 else 0.5
-    return intercept, slope, math.sqrt(max(var, 0.0)), se, n
+    if m % 2:
+        return ordered[m // 2]
+    return 0.5 * (ordered[m // 2 - 1] + ordered[m // 2])
 
 
 def quantiles(median, sigma):
-    """Five quantiles around a median rate, rounded half-up, non-decreasing."""
-    base = logit(median)
+    lg = logit(median)
     out = []
-    prev = 0.0
+    prev = None
     for z in Z:
-        q = round4(inv_logit(base + z * sigma))
-        q = min(100, max(0, q))
-        if q < prev:
+        q = round4(inv_logit(lg + z * sigma))
+        q = min(100.0, max(0.0, q))
+        if prev is not None and q < prev:
             q = prev
         out.append(q)
         prev = q
@@ -158,157 +157,179 @@ def fallback_rows(case):
             rate = last_rates[i]
         if rate is None:
             rate = 1.0
-        if rate >= 100:
-            rows.append({"id": trophy["id"], "q": [99.9, 100, 100, 100, 100]})
-        else:
-            rows.append({"id": trophy["id"], "q": quantiles(clamp_rate(rate), 2.0)})
+        rows.append({"id": trophy["id"], "q": quantiles(clamp_rate(rate), 2.5)})
     return {"trophies": rows}
 
 
-def forecast_case(case):
+def forecast_case(case, name):
     trophies = case["trophies"]
     history = case["history"]
     if not history:
-        raise ValueError("case has no history")
+        raise ValueError(f"{name} has no history")
     horizon_days = case["horizon_minutes"] / 1440.0
-    target = parse_time(case["target"])
-    release_text = (case.get("game") or {}).get("release_date") or "2026-11-19"
+    release = RELEASE
     try:
-        release = datetime.fromisoformat(release_text).replace(tzinfo=timezone.utc)
-    except ValueError:
+        rel = case.get("game", {}).get("release_date")
+        if rel:
+            release = datetime.fromisoformat(str(rel) + "T00:00:00+00:00")
+    except (ValueError, TypeError):
         release = RELEASE
-    x_target = math.log1p(hours_since_release(target, release))
+    try:
+        target = parse_time(case["target"])
+    except (KeyError, ValueError, TypeError):
+        target = parse_time(case["at"])
+    x_target = math.log1p(max(0.0, (target - release).total_seconds() / 3600.0))
+    checkpoint = parse_time(case["at"])
 
-    # One (x, weight) per read, plus the tracked population per read.
-    read_times = [parse_time(h["at"]) for h in history]
-    t_last = read_times[-1]
-    xs = [math.log1p(hours_since_release(t, release)) for t in read_times]
-    weights = [
-        0.5 ** ((t_last - t).total_seconds() / 3600.0 / HALF_LIFE_HOURS)
-        for t in read_times
-    ]
-    populations = []
-    for h in history:
-        n = h.get("players_tracked")
-        populations.append(float(n) if isinstance(n, (int, float)) and n > 0 else None)
+    # Per-read x and recency weight (24h half-life from the checkpoint).
+    reads = []
+    for entry in history:
+        try:
+            at = parse_time(entry["at"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        hours = max(0.0, (at - release).total_seconds() / 3600.0)
+        age = max(0.0, (checkpoint - at).total_seconds() / 3600.0)
+        weight = 0.5 ** (age / HALF_LIFE_HOURS)
+        reads.append((math.log1p(hours), weight, entry))
+    if not reads:
+        raise ValueError(f"{name} has no usable reads")
+    last = reads[-1][2]
+    last_n = last.get("players_tracked") or 0
 
-    # Flat history: every rate and the tracked count unchanged throughout.
-    flat = all(p == populations[0] for p in populations)
-    if flat:
-        for i in range(len(trophies)):
-            seen = {h["rates"][i] for h in history if h["rates"][i] is not None}
-            if len(seen) > 1:
-                flat = False
-                break
+    # Fit log(N) once for the whole case.
+    n_points = []
+    for x, w, entry in reads:
+        n = entry.get("players_tracked")
+        if n and n > 0:
+            n_points.append((x, math.log(n), w))
+    n_fit = wls(n_points)
+    log_n_target = None
+    if n_fit is not None:
+        log_n_target = n_fit[0] + n_fit[1] * x_target
 
-    last = history[-1]
-    last_rates = last["rates"]
-    last_n = populations[-1] or 0.0
-
-    # Tier medians of the last read's positive rates, for the zero-rate floor.
-    tier_last = {}
-    for trophy, rate in zip(trophies, last_rates):
-        if rate is not None and rate > 0:
-            tier_last.setdefault(trophy["tier"], []).append(rate)
-    tier_floor = {
-        tier: max(0.01, 0.1 * median_of(rates)) for tier, rates in tier_last.items()
-    }
-
-    if flat:
-        sigma = min(SIGMA_CAP, max(0.5, 1.2 * math.sqrt(horizon_days)))
-        rows = []
-        for i, trophy in enumerate(trophies):
-            rate = last_rates[i]
-            if rate is None:
-                rate = tier_floor.get(trophy["tier"], 1.0)
-            if rate >= 100:
-                rows.append({"id": trophy["id"], "q": [99.9, 100, 100, 100, 100]})
-                continue
-            if rate <= 0:
-                med = tier_floor.get(trophy["tier"], 0.1)
-            elif last_n < 10000:
-                med = rate * 0.3
-            else:
-                med = rate / math.sqrt(1.0 + horizon_days)
-            rows.append({"id": trophy["id"], "q": quantiles(clamp_rate(med), sigma)})
-        return {"trophies": rows}
-
-    # Population fit: log(N) on x, shared by every trophy.
-    n_xs, n_ys, n_ws = [], [], []
-    for x, w, pop in zip(xs, weights, populations):
-        if pop is not None:
-            n_xs.append(x)
-            n_ys.append(math.log(pop))
-            n_ws.append(w)
-    b_n, s_n, r_n, se_n, _ = wls(n_xs, n_ys, n_ws)
-
-    # Per-trophy earner fits: log(E) on x, E = rate / 100 * N.
-    fits = []
+    # Fit log(E) per trophy, remembering each raw slope for tier shrinkage.
+    raw_slopes = {}
+    fits = {}
     for i, trophy in enumerate(trophies):
-        e_xs, e_ys, e_ws = [], [], []
-        for j, h in enumerate(history):
-            rate = h["rates"][i]
-            pop = populations[j]
-            if rate is None or pop is None or rate <= 0:
+        points = []
+        for x, w, entry in reads:
+            rates = entry.get("rates") or []
+            if i >= len(rates) or rates[i] is None:
                 continue
-            e = rate / 100.0 * pop
-            if e <= 0:
+            n = entry.get("players_tracked")
+            if not n or n <= 0:
                 continue
-            e_xs.append(xs[j])
-            e_ys.append(math.log(e))
-            e_ws.append(weights[j])
-        fits.append(wls(e_xs, e_ys, e_ws))
-
-    # Tier median earner slopes, for shrinkage.
-    tier_slopes = {}
-    for trophy, fit in zip(trophies, fits):
-        if fit[4] >= 3:
-            tier_slopes.setdefault(trophy["tier"], []).append(fit[1])
-    all_slopes = [s for slopes in tier_slopes.values() for s in slopes]
-    global_slope = median_of(all_slopes) if all_slopes else 0.0
-    tier_median = {
-        tier: median_of(slopes) for tier, slopes in tier_slopes.items()
+            earners = rates[i] / 100.0 * n
+            if earners <= 0:
+                continue
+            points.append((x, math.log(earners), w))
+        fit = wls(points)
+        fits[i] = (fit, len(points))
+        if fit is not None:
+            raw_slopes.setdefault(trophy["tier"], []).append(fit[1])
+    tier_median_slope = {
+        tier: median_of(slopes) for tier, slopes in raw_slopes.items()
     }
 
+    flat_sigma = min(2.5, max(0.5, 1.2 * math.sqrt(horizon_days)))
     rows = []
     for i, trophy in enumerate(trophies):
-        rate = last_rates[i]
-        if rate is None:
-            rate = tier_floor.get(trophy["tier"], 1.0)
-        if rate >= 100:
+        rates = last.get("rates") or []
+        last_rate = rates[i] if i < len(rates) else None
+        if last_rate is None:
+            last_rate = 1.0
+        # A trophy at 100% in the last read stays at ~100%.
+        if last_rate >= 100.0:
             rows.append({"id": trophy["id"], "q": [99.9, 100, 100, 100, 100]})
             continue
-        b_e, s_e, r_e, se_e, n_e = fits[i]
-        if rate <= 0:
-            med = tier_floor.get(trophy["tier"], 0.1)
-            sigma = min(SIGMA_CAP, max(SIGMA_FLOOR, 0.5 * math.sqrt(horizon_days)))
-            rows.append({"id": trophy["id"], "q": quantiles(clamp_rate(med), sigma)})
+        # Flat history for this trophy: no movement at all in rates or in N.
+        trophy_rates = []
+        ns = []
+        for _, _, entry in reads:
+            r = (entry.get("rates") or [])
+            trophy_rates.append(r[i] if i < len(r) else None)
+            ns.append(entry.get("players_tracked"))
+        flat = (
+            len(set(trophy_rates)) <= 1
+            and len(set(ns)) <= 1
+            and trophy_rates
+            and trophy_rates[0] is not None
+        )
+        if flat:
+            if last_n < 10000:
+                median = last_rate * 0.3
+            else:
+                median = last_rate / math.sqrt(1.0 + horizon_days)
+            rows.append(
+                {"id": trophy["id"], "q": quantiles(clamp_rate(median), flat_sigma)}
+            )
             continue
-        # Shrink the earner slope toward the tier median slope.
-        prior = tier_median.get(trophy["tier"], global_slope)
-        w = n_e / (n_e + SHRINK_PRIOR) if n_e else 0.0
-        slope = w * s_e + (1.0 - w) * prior
-        slope = max(-1.5, min(1.5, slope))
+        fit, n_pts = fits[i]
+        if fit is None or log_n_target is None:
+            rows.append(
+                {"id": trophy["id"], "q": quantiles(clamp_rate(last_rate), flat_sigma)}
+            )
+            continue
+        intercept, slope, resid, slope_se, xbar = fit
+        # Shrink the earner slope toward the tier's median slope.
+        tier_slope = tier_median_slope.get(trophy["tier"], slope)
+        w = n_pts / (n_pts + SHRINK_PRIOR) if n_pts else 0.0
+        slope = w * slope + (1.0 - w) * tier_slope
         if trophy["tier"] == "platinum":
-            # The platinum grows only as players finish everything:
-            # shrink heavily toward a slow-growth prior and cap low.
+            # The platinum only grows as players finish everything: shrink
+            # heavily toward zero growth and keep the median single-digit.
             slope = 0.25 * slope
-        log_e = b_e + slope * x_target
-        log_n = b_n + s_n * x_target
-        med = 100.0 * math.exp(log_e - log_n)
+        log_e_target = intercept + slope * x_target
+        median = 100.0 * math.exp(log_e_target) / math.exp(log_n_target)
         if trophy["tier"] == "platinum":
-            med = min(med, PLATINUM_CAP)
-        med = clamp_rate(med)
-        resid = math.sqrt(r_e * r_e + r_n * r_n)
-        unc = math.sqrt(se_e * se_e + se_n * se_n)
-        dist = max(0.0, x_target - xs[-1])
+            median = min(median, 9.99)
+        if last_rate <= 0:
+            # A trophy nobody has yet: a small floor from its tier's median.
+            tier_last = median_of(
+                [
+                    (last.get("rates") or [])[j]
+                    for j, t in enumerate(trophies)
+                    if t["tier"] == trophy["tier"]
+                    and j < len(last.get("rates") or [])
+                    and (last.get("rates") or [])[j] is not None
+                ]
+            )
+            median = max(0.01, 0.1 * tier_last)
+        median = clamp_rate(median)
         sigma = math.sqrt(
             (0.5 * math.sqrt(horizon_days)) ** 2
-            + resid * resid
-            + (unc * dist) ** 2
+            + resid ** 2
+            + (slope_se * abs(x_target - xbar)) ** 2
         )
-        sigma = min(SIGMA_CAP, max(SIGMA_FLOOR, sigma))
-        rows.append({"id": trophy["id"], "q": quantiles(med, sigma)})
+        sigma = min(2.5, max(0.35, sigma))
+        rows.append({"id": trophy["id"], "q": quantiles(median, sigma)})
+    # Logical consistency: earning the platinum requires earning every
+    # other trophy, so the platinum's rate can never exceed the lowest
+    # rate among the other trophies. If the fitted platinum median sits
+    # above that minimum, shift its whole quantile row down in logit
+    # space by exactly the logit difference, so its median equals the
+    # minimum and the row stays ordered and in range.
+    plat_idx = next(
+        (k for k, t in enumerate(trophies) if t["tier"] == "platinum"), None
+    )
+    if plat_idx is not None:
+        others = [rows[k]["q"][2] for k in range(len(rows)) if k != plat_idx]
+        if others:
+            lowest_other = min(others)
+            plat_median = rows[plat_idx]["q"][2]
+            if plat_median > lowest_other:
+                shift = logit(plat_median) - logit(lowest_other)
+                shifted = []
+                prev = None
+                for q in rows[plat_idx]["q"]:
+                    v = round4(inv_logit(logit(q) - shift))
+                    v = min(100.0, max(0.0, v))
+                    if prev is not None and v < prev:
+                        v = prev
+                    shifted.append(v)
+                    prev = v
+                rows[plat_idx]["q"] = shifted
     return {"trophies": rows}
 
 
@@ -317,15 +338,16 @@ def main():
     for path in sorted(INPUT_DIR.glob("*.in")):
         try:
             case = json.loads(path.read_text(encoding="utf-8"))
-            forecast = forecast_case(case)
+        except (OSError, ValueError):
+            continue
+        try:
+            forecast = forecast_case(case, path.name)
         except Exception:
             try:
-                case = json.loads(path.read_text(encoding="utf-8"))
                 forecast = fallback_rows(case)
             except Exception:
                 continue
-        out_path = OUTPUT_DIR / f"{path.stem}.out"
-        out_path.write_text(
+        (OUTPUT_DIR / f"{path.stem}.out").write_text(
             json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8"
         )
 
